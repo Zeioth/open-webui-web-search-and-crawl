@@ -4,7 +4,7 @@ description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, a
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.1.9
+version: 3.2.0
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -401,6 +401,42 @@ class Tools:
             description="Force research crawling on or off regardless of the LLM's choice. 'auto' uses the LLM-provided research_mode parameter and the user valve. When set to 'always' or 'never', the research_mode parameter from the LLM is ignored.",
         )
 
+        # ── Research Strategy Policy ─────────────────────────────────────────
+        RESEARCH_STRATEGY_POLICY: Literal[
+            "auto", "pseudo_adaptive", "llm_guided", "bfs_deep", "research_filter"
+        ] = Field(
+            default="auto",
+            title="Research Strategy Policy",
+            description="Force a specific crawling strategy when research mode is active. If 'auto', the strategy is chosen by the LLM, auto‑detected from the URLs, or falls back to the user valve.",
+        )
+
+        # ── Relevance Filter & Refinement ────────────────────────────────────
+        RELEVANCE_FILTER_ENABLED: bool = Field(
+            default=True,
+            title="Enable Relevance Filter & Refinement",
+            description="If true, after crawling the system evaluates the relevance of extracted content. If the fraction of relevant content falls below RELEVANCE_THRESHOLD, it will reformulate the query and search again, up to MAX_REFINEMENT_ROUNDS times, to gather more useful information.",
+        )
+        RELEVANCE_THRESHOLD: float = Field(
+            default=0.6,
+            ge=0.0,
+            le=1.0,
+            title="Relevance Threshold",
+            description="Minimum fraction of extracted content tokens that must be classified as relevant to avoid triggering a refinement round.",
+        )
+        MAX_REFINEMENT_ROUNDS: int = Field(
+            default=2,
+            ge=0,
+            le=5,
+            title="Max Refinement Rounds",
+            description="Maximum number of additional search/crawl rounds when relevance is insufficient. 0 = no retries.",
+        )
+        REFINEMENT_LLM_PROVIDER: str = Field(
+            default="",
+            title="LLM Provider for Refinement",
+            description="LLM provider/model used for relevance classification and query reformulation. If empty, falls back to FILTER_LLM_PROVIDER or LLM_PROVIDER.",
+            examples=["ollama/llama3.2", "openai/gpt-4o-mini"],
+        )
+
         # ── Debug & Misc ─────────────────────────────────────────────────────
         MORE_STATUS: bool = Field(
             title="More status updates",
@@ -536,6 +572,12 @@ class Tools:
         self._cache_collection = None
         self._excluded_collection = None
         self._validation_session: Optional[aiohttp.ClientSession] = None
+        self._visited_urls: set[str] = (
+            set()
+        )  # URLs already crawled (across refinement rounds)
+        self._previous_queries: List[str] = (
+            []
+        )  # queries already used (original + reformulations)
 
         self._configure()
 
@@ -1999,9 +2041,7 @@ class Tools:
     # region ── Crawl Helpers ──────────────────────────────────────────────────
 
     def _compute_token_budget(self, page_index: int, max_tokens: int) -> Optional[int]:
-        """Calcula el presupuesto de tokens para una página dada.
-        Retorna None si max_tokens <= 0 o el presupuesto está por debajo del mínimo.
-        """
+        """Calculates the token budget for a given page."""
         if max_tokens <= 0:
             return None
         budget = int(
@@ -2012,7 +2052,7 @@ class Tools:
         return budget
 
     async def _emit_skip_budget_status(self, url: str, budget: int, __event_emitter__):
-        """Emite un mensaje de estado cuando se omite una URL por presupuesto insuficiente."""
+        """Emits a status message when a URL is skipped due to insufficient budget."""
         if __event_emitter__ and self.valves.MORE_STATUS:
             await __event_emitter__(
                 {
@@ -2027,8 +2067,7 @@ class Tools:
     async def _validate_and_mark_crawled(
         self, url: str, crawled_set: set, query: str, __event_emitter__
     ) -> bool:
-        """Valida la URL con el pipeline y, si es válida, la añade al conjunto de ya rastreadas.
-        Retorna True si la URL fue validada y marcada."""
+        """Validates the URL through the pipeline and, if valid, adds it to the set of already crawled URLs."""
         validated = await self._validate_url_pipeline(
             [url], query, check_keywords=False, __event_emitter__=__event_emitter__
         )
@@ -3417,7 +3456,7 @@ Now evaluate these URLs:
                 batch_index = len(batches)
                 batches.append((batch, batch_index))
 
-                # Usar el nuevo helper para calcular el presupuesto
+                # Use the new helper to calculate the budget
                 budget = self._compute_token_budget(
                     self.pages_crawled + batch_index + 1, max_tokens
                 )
@@ -4116,6 +4155,9 @@ Now evaluate these URLs:
         self.content_counter = 0
         self.pages_crawled = 0
         self.total_urls = 0
+        self._visited_urls.clear()
+        self._previous_queries.clear()
+        self._previous_queries.append(query)
 
         # 1. Prepare search URLs
         gathered_urls, user_provided_urls = await self._prepare_search_urls(
@@ -4139,106 +4181,205 @@ Now evaluate these URLs:
             )
             return f"No URLs found to crawl for the query: {query}."
 
-        # Prioritize user-provided URLs
-        search_only_urls = [
-            url for url in gathered_urls if url not in user_provided_urls
-        ]
-        gathered_urls = user_provided_urls + search_only_urls
+        # ── Begin refinement loop ────────────────────────────────────────
+        all_crawl_results = []
+        all_image_list = []
+        all_video_list = []
+        total_tokens_accum = 0
+        round_num = 1
+        max_rounds = 1 + (
+            self.valves.MAX_REFINEMENT_ROUNDS
+            if self.valves.RELEVANCE_FILTER_ENABLED
+            else 0
+        )
 
-        # Limit URLs
-        max_urls = self.user_valves.CRAWL4AI_MAX_URLS or self.valves.CRAWL4AI_MAX_URLS
-        if len(gathered_urls) > max_urls:
-            if self.valves.DEBUG:
-                logger.info(f"Limiting URLs from {len(gathered_urls)} to {max_urls}")
-            if __event_emitter__ and self.valves.MORE_STATUS:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"✂️ Limiting to {max_urls} URLs (from {len(gathered_urls)} total). Prioritizing URLs provided by the user.",
-                            "done": False,
-                        },
-                    }
-                )
-                await asyncio.sleep(0.3)
-            gathered_urls = gathered_urls[:max_urls]
+        current_query = query
+        gathered_for_round = gathered_urls
+        user_provided_for_round = user_provided_urls
 
-        # Determine research mode and crawl strategy considering the new policy valve
-        policy = self.valves.RESEARCH_MODE_POLICY
+        while round_num <= max_rounds:
+            # Prioritize user-provided URLs (once, first round)
+            if round_num == 1:
+                search_only_urls = [
+                    url
+                    for url in gathered_for_round
+                    if url not in user_provided_for_round
+                ]
+                gathered_for_round = user_provided_for_round + search_only_urls
 
-        if policy == "always":
-            effective_research_mode = True
-            effective_crawl_mode = (
-                research_crawl_mode or self.user_valves.RESEARCH_CRAWL_MODE
+            # Limit URLs
+            max_urls = (
+                self.user_valves.CRAWL4AI_MAX_URLS or self.valves.CRAWL4AI_MAX_URLS
             )
-            if self.valves.DEBUG:
-                logger.info("Research mode forced ON by valve policy")
-        elif policy == "never":
-            effective_research_mode = False
-            effective_crawl_mode = (
-                research_crawl_mode or self.user_valves.RESEARCH_CRAWL_MODE
-            )
-            if self.valves.DEBUG:
-                logger.info("Research mode forced OFF by valve policy")
-        else:  # auto
-            # Use the original logic: LLM parameter and user valve
-            if research_crawl_mode and research_crawl_mode in [
-                "pseudo_adaptive",
-                "llm_guided",
-                "bfs_deep",
-                "research_filter",
-            ]:
-                effective_research_mode = True
-                effective_crawl_mode = research_crawl_mode
+            if len(gathered_for_round) > max_urls:
                 if self.valves.DEBUG:
                     logger.info(
-                        f"Research mode activated via research_crawl_mode parameter: {research_crawl_mode}"
+                        f"Limiting URLs from {len(gathered_for_round)} to {max_urls}"
+                    )
+                if __event_emitter__ and self.valves.MORE_STATUS:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"✂️ Limiting to {max_urls} URLs (from {len(gathered_for_round)} total). Prioritizing URLs provided by the user.",
+                                "done": False,
+                            },
+                        }
+                    )
+                    await asyncio.sleep(0.3)
+                gathered_for_round = gathered_for_round[:max_urls]
+
+            # Determine research mode and crawl strategy (same logic)
+            mode_policy = self.valves.RESEARCH_MODE_POLICY
+            strategy_policy = self.valves.RESEARCH_STRATEGY_POLICY
+
+            if mode_policy == "always":
+                effective_research_mode = True
+                if self.valves.DEBUG:
+                    logger.info("Research mode forced ON by RESEARCH_MODE_POLICY")
+            elif mode_policy == "never":
+                effective_research_mode = False
+                if self.valves.DEBUG:
+                    logger.info("Research mode forced OFF by RESEARCH_MODE_POLICY")
+            else:  # auto
+                if research_crawl_mode and research_crawl_mode in [
+                    "pseudo_adaptive",
+                    "llm_guided",
+                    "bfs_deep",
+                    "research_filter",
+                ]:
+                    effective_research_mode = True
+                else:
+                    effective_research_mode = (
+                        research_mode or self.user_valves.RESEARCH_MODE
+                    )
+                if self.valves.DEBUG:
+                    logger.info(f"Research mode (auto) -> {effective_research_mode}")
+
+            if strategy_policy != "auto":
+                effective_crawl_mode = strategy_policy
+                if self.valves.DEBUG:
+                    logger.info(
+                        f"Research strategy forced by RESEARCH_STRATEGY_POLICY: {effective_crawl_mode}"
                     )
             else:
-                effective_research_mode = (
-                    research_mode or self.user_valves.RESEARCH_MODE
-                )
-                # Si el LLM no dió modo explícito, intentamos auto‑seleccionar
-                if not research_crawl_mode:
-                    effective_crawl_mode = self._auto_select_research_mode(
-                        gathered_urls, query
-                    )
-                else:
+                if research_crawl_mode in [
+                    "pseudo_adaptive",
+                    "llm_guided",
+                    "bfs_deep",
+                    "research_filter",
+                ]:
                     effective_crawl_mode = research_crawl_mode
-                if self.valves.DEBUG:
-                    logger.info(
-                        f"Research mode: {effective_research_mode}, mode: {effective_crawl_mode}"
+                    if self.valves.DEBUG:
+                        logger.info(
+                            f"Research strategy from LLM: {effective_crawl_mode}"
+                        )
+                else:
+                    effective_crawl_mode = self._auto_select_research_mode(
+                        gathered_for_round, current_query
                     )
+                    if self.valves.DEBUG:
+                        logger.info(
+                            f"Research strategy auto-detected: {effective_crawl_mode}"
+                        )
 
-        self.total_urls = len(gathered_urls)
+            self.total_urls = len(gathered_for_round)
 
-        # 2. Execute crawl (normal or research)
-        if effective_research_mode and gathered_urls:
-            if __event_emitter__ and self.valves.MORE_STATUS:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Research Mode enabled. Using '{effective_crawl_mode}' strategy...",
-                            "done": False,
-                        },
-                    }
+            # 2. Execute crawl (normal or research)
+            if effective_research_mode and gathered_for_round:
+                if __event_emitter__ and self.valves.MORE_STATUS:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Research Mode enabled. Using '{effective_crawl_mode}' strategy... (Round {round_num})",
+                                "done": False,
+                            },
+                        }
+                    )
+                round_crawl_results, round_images, round_videos, round_tokens = (
+                    await self._run_research_crawl(
+                        gathered_for_round,
+                        current_query,
+                        effective_crawl_mode,
+                        max_urls,
+                        __event_emitter__,
+                    )
                 )
-            crawl_results, image_list, video_list, total_tokens = (
-                await self._run_research_crawl(
-                    gathered_urls,
-                    query,
-                    effective_crawl_mode,
-                    max_urls,
-                    __event_emitter__,
+            else:
+                round_crawl_results, round_images, round_videos, round_tokens = (
+                    await self._run_normal_crawl(
+                        gathered_for_round, current_query, max_images, __event_emitter__
+                    )
                 )
-            )
-        else:
-            crawl_results, image_list, video_list, total_tokens = (
-                await self._run_normal_crawl(
-                    gathered_urls, query, max_images, __event_emitter__
+
+            # Accumulate results
+            all_crawl_results.extend(round_crawl_results)
+            all_image_list.extend(round_images)
+            all_video_list.extend(round_videos)
+            total_tokens_accum += round_tokens
+
+            # Track visited URLs
+            for url in gathered_for_round:
+                self._visited_urls.add(url)
+
+            # Relevance evaluation and possible refinement
+            if (
+                self.valves.RELEVANCE_FILTER_ENABLED
+                and round_num <= self.valves.MAX_REFINEMENT_ROUNDS
+            ):
+                enough, filtered_content = await self._evaluate_content_relevance(
+                    all_crawl_results, current_query, __event_emitter__
                 )
-            )
+                if enough:
+                    all_crawl_results = filtered_content
+                    break
+                else:
+                    if round_num >= max_rounds:
+                        if __event_emitter__ and self.valves.MORE_STATUS:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": "⚠️ Maximum refinement rounds reached. Proceeding with current content.",
+                                        "done": False,
+                                    },
+                                }
+                            )
+                        all_crawl_results = filtered_content
+                        break
+                    # Reformulate query
+                    new_query = await self._reformulate_query(
+                        current_query, all_crawl_results, __event_emitter__
+                    )
+                    if not new_query or new_query == current_query:
+                        logger.warning(
+                            "Refinement failed to generate new query; stopping."
+                        )
+                        all_crawl_results = filtered_content
+                        break
+                    current_query = new_query
+                    self._previous_queries.append(current_query)
+                    # Prepare new search URLs, excluding visited
+                    gathered_for_round, user_provided_for_round = (
+                        await self._prepare_search_urls(
+                            current_query, None, __event_emitter__, __user__
+                        )
+                    )
+                    gathered_for_round = [
+                        u for u in gathered_for_round if u not in self._visited_urls
+                    ]
+                    if not gathered_for_round:
+                        logger.info("No new URLs found after refinement; stopping.")
+                        all_crawl_results = filtered_content
+                        break
+                    round_num += 1
+            else:
+                all_crawl_results = round_crawl_results
+                break
+
+        # Final content is in all_crawl_results
+        crawl_results = all_crawl_results
 
         # Normalize final results
         crawl_results = self._normalize_content(crawl_results)
@@ -4247,11 +4388,13 @@ Now evaluate these URLs:
         crawl_results = await self._deduplicate_content(crawl_results)
 
         # 3. Display media
-        await self._display_media(image_list, video_list, max_images, __event_emitter__)
+        await self._display_media(
+            all_image_list, all_video_list, max_images, __event_emitter__
+        )
 
         # 4. Final status
         await self._emit_final_status(
-            crawl_results, start_time, __event_emitter__, total_tokens
+            crawl_results, start_time, __event_emitter__, total_tokens_accum
         )
 
         # Close shared validation session
@@ -4261,6 +4404,163 @@ Now evaluate these URLs:
             f"Search and crawl finished in {time.time() - start_time:.2f} seconds"
         )
         return crawl_results
+
+    # endregion
+
+    # region ── Relevance Filter & Refinement Methods ─────────────────────────
+
+    async def _evaluate_content_relevance(
+        self,
+        content_items: List[dict],
+        query: str,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> Tuple[bool, List[dict]]:
+        """
+        Evaluates the relevance of the extracted content.
+        Returns (enough: bool, filtered_items: List[dict]).
+        - enough = True if the proportion of relevant tokens >= RELEVANCE_THRESHOLD.
+        - filtered_items = list of fragments marked as relevant.
+        """
+        if not content_items:
+            return True, content_items
+
+        summaries = [item.get("summary", "") for item in content_items]
+        if not summaries:
+            return True, content_items
+
+        # Split into chunks to avoid overloading the LLM
+        chunk_size = 4
+        all_classifications = []
+        for i in range(0, len(summaries), chunk_size):
+            batch = summaries[i : i + chunk_size]
+            prompt = (
+                "You are a content relevance classifier. For each text fragment below, decide if it is RELEVANT or NOISE "
+                f'with respect to the query: "{query}". RELEVANT means it provides useful information directly related to the query. '
+                "Return ONLY a JSON array of strings, either 'RELEVANT' or 'NOISE', one per fragment.\n\nFragments:\n"
+            )
+            for idx, text in enumerate(batch):
+                prompt += f"{idx}: {text[:300]}\n"
+            prompt += "\nJSON array:"
+            try:
+                provider = (
+                    self.valves.REFINEMENT_LLM_PROVIDER
+                    or self.valves.FILTER_LLM_PROVIDER
+                    or self.valves.LLM_PROVIDER
+                )
+                content = await self._call_llm(
+                    prompt=prompt,
+                    system="Return only a JSON array of strings. No other text.",
+                    provider=provider,
+                    temperature=0.0,
+                    max_tokens=200,
+                    timeout=30,
+                )
+                import json, re
+
+                content = content.strip()
+                arr_match = re.search(r"\[.*\]", content, re.DOTALL)
+                if arr_match:
+                    content = arr_match.group(0)
+                classifications = json.loads(content)
+                if isinstance(classifications, list) and len(classifications) == len(
+                    batch
+                ):
+                    all_classifications.extend(classifications)
+                else:
+                    all_classifications.extend(["RELEVANT"] * len(batch))
+            except Exception as e:
+                logger.warning(
+                    f"Relevance classification error: {e}, marking all as relevant"
+                )
+                all_classifications.extend(["RELEVANT"] * len(batch))
+
+        filtered_items = [
+            item
+            for item, cls in zip(content_items, all_classifications)
+            if cls == "RELEVANT"
+        ]
+
+        total_tokens = await self._count_tokens(
+            orjson.dumps([item["summary"] for item in content_items]).decode()
+        )
+        relevant_tokens = await self._count_tokens(
+            orjson.dumps([item["summary"] for item in filtered_items]).decode()
+        )
+        ratio = relevant_tokens / total_tokens if total_tokens > 0 else 1.0
+
+        # Fallback: all relevant
+        if __event_emitter__ and self.valves.MORE_STATUS:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"🧠 Relevance: {relevant_tokens}/{total_tokens} tokens relevant ({ratio:.1%})",
+                        "done": False,
+                    },
+                }
+            )
+
+        enough = ratio >= self.valves.RELEVANCE_THRESHOLD
+        return enough, filtered_items
+
+    async def _reformulate_query(
+        self,
+        original_query: str,
+        current_content: List[dict],
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Asks the LLM to reformulate the query to obtain more relevant information,
+        avoiding previously used terms.
+        """
+        previous_queries_str = "\n".join(f"- {q}" for q in self._previous_queries)
+        prompt = f"""The previous search query "{original_query}" did not yield enough relevant content. 
+We need a new search query that is more specific or uses different terms to find better information.
+Avoid repeating any of the following previously used queries:
+{previous_queries_str}
+
+Generate ONLY the new query string, nothing else."""
+        if __event_emitter__ and self.valves.MORE_STATUS:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "🔄 Reformulating query to improve relevance...",
+                        "done": False,
+                    },
+                }
+            )
+        try:
+            provider = (
+                self.valves.REFINEMENT_LLM_PROVIDER
+                or self.valves.FILTER_LLM_PROVIDER
+                or self.valves.LLM_PROVIDER
+            )
+            new_query = await self._call_llm(
+                prompt=prompt,
+                system="You only output the new query string, no extra text.",
+                provider=provider,
+                temperature=0.3,
+                max_tokens=80,
+                timeout=30,
+            )
+            new_query = new_query.strip().strip('"').strip("'")
+            if new_query and new_query != original_query:
+                logger.info(f"Query reformulated: {original_query} -> {new_query}")
+                if __event_emitter__ and self.valves.MORE_STATUS:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"🔎 New query: {new_query}",
+                                "done": False,
+                            },
+                        }
+                    )
+                return new_query
+        except Exception as e:
+            logger.error(f"Query reformulation error: {e}")
+        return original_query
 
     # endregion
 
@@ -4595,10 +4895,10 @@ Now evaluate these URLs:
 
     def _auto_select_research_mode(self, urls: List[str], query: str) -> str:
         """
-        Heurística para elegir la mejor estrategia de investigación basada en las URLs.
-        - Si más del 50% de las URLs comparten el mismo dominio y es un dominio tipo wiki/enciclopedia, usa 'bfs_deep'.
-        - Si las URLs tienen slugs descriptivos (contienen guiones, barras, palabras clave), prefiere 'pseudo_adaptive'.
-        - En otros casos, 'research_filter' para evitar ruido.
+        Heuristic to choose the best research strategy based on the URLs.
+        - If more than 50% of the URLs share the same domain and it is a wiki/encyclopedia-like domain, use 'bfs_deep'.
+        - If the URLs have descriptive slugs (contain hyphens, slashes, keywords), prefer 'pseudo_adaptive'.
+        - In other cases, 'research_filter' to avoid noise.
         """
         if not urls:
             return "pseudo_adaptive"
@@ -4613,7 +4913,7 @@ Now evaluate these URLs:
         most_common_domain, count = domain_counts.most_common(1)[0]
         domain_ratio = count / len(urls)
 
-        # Dominios típicos de conocimiento profundo
+        # Typical knowledge domains
         knowledge_domains = {
             "wikipedia.org",
             "wikimedia.org",
@@ -4631,18 +4931,18 @@ Now evaluate these URLs:
             )
             return "bfs_deep"
 
-        # Evaluar descriptividad de slugs
+        # Evaluate slug descriptiveness
         descriptive_count = 0
         for url in urls:
             path = urlparse(url).path
-            # Slugs descriptivos suelen tener varias palabras separadas por guiones o barras
+            # Descriptive slugs usualy have several words separated by - or /
             parts = [p for p in path.split("/") if p and not p.startswith("?")]
             if parts and any("-" in p or "_" in p for p in parts):
                 descriptive_count += 1
 
         if descriptive_count > len(urls) * 0.5:
             logger.info(
-                "Auto-selecting 'pseudo_adaptive' (URLs con slugs descriptivos)"
+                "Auto-selecting 'pseudo_adaptive' (URLs with descriptive slugs)"
             )
             return "pseudo_adaptive"
 
