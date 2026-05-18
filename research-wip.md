@@ -1,3 +1,5 @@
+NOTA: Todos los modos research se benefician de usar procesamiento por lotes grandes. Por defecto usamos '3' para no desbordar la memoria y el timeout de crawl4ai. Pero equipos con mas recursos podrían mejorar la relevancia de los resultados aumentando este valor.
+
 Diferencias entre los modos de investigación (research_mode)
 
 Los cuatro modos de investigación (pseudo_adaptive, llm_guided, bfs_deep, research_filter) determinan cómo se descubren y seleccionan enlaces secundarios a partir de las páginas iniciales (resultados de búsqueda). Su objetivo es profundizar en un sitio o tema siguiendo enlaces relevantes, pero cada uno tiene una estrategia distinta que afecta al rendimiento, exhaustividad y precisión.
