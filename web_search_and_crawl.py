@@ -4,7 +4,7 @@ description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, a
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.1.8
+version: 3.1.9
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -169,6 +169,11 @@ class Tools:
             title="Crawl4AI Maximum URLs to crawl",
             default=20,
             description="The maximum number of URLs to crawl with Crawl4AI.",
+        )
+        CRAWL4AI_MAX_URLS_FORCE: bool = Field(
+            default=False,
+            title="Force Max URLs",
+            description="If true, the LLM URL filter will force the final URL count to reach CRAWL4AI_MAX_URLS by backfilling from rejected URLs. When false, the filter only keeps the URLs deemed relevant by the LLM.",
         )
         CRAWL4AI_PARALLEL_BATCHES: int = Field(
             default=3,
@@ -389,6 +394,13 @@ class Tools:
             examples=["ollama/llama3.2", "openai/gpt-4o-mini"],
         )
 
+        # ── Research Mode Policy ─────────────────────────────────────────────
+        RESEARCH_MODE_POLICY: Literal["always", "never", "auto"] = Field(
+            default="auto",
+            title="Research Mode Policy",
+            description="Force research crawling on or off regardless of the LLM's choice. 'auto' uses the LLM-provided research_mode parameter and the user valve. When set to 'always' or 'never', the research_mode parameter from the LLM is ignored.",
+        )
+
         # ── Debug & Misc ─────────────────────────────────────────────────────
         MORE_STATUS: bool = Field(
             title="More status updates",
@@ -449,11 +461,6 @@ class Tools:
             title="Crawl4AI Maximum URLs to crawl",
             default=None,
             description="Per-user maximum URLs to crawl.",
-        )
-        CRAWL4AI_MAX_URLS_FORCE: bool = Field(
-            default=False,
-            title="Force Max URLs",
-            description="If true, the LLM URL filter will force the final URL count to reach CRAWL4AI_MAX_URLS by backfilling from rejected URLs. When false, the filter only keeps the URLs deemed relevant by the LLM. Use this valve to experiment: Small % to make results richer, high % of wasting tokens and poison irrelevant context. Good results for enriching cache with filters though.",
         )
         CRAWL4AI_DISPLAY_MEDIA: bool = Field(
             title="Display Media in Chat",
@@ -575,7 +582,7 @@ class Tools:
                             },
                             "research_mode": {
                                 "type": "boolean",
-                                "description": "Enable deep crawling that follows links from the first results. Activate ONLY when the answer truly benefits from multiple in‑depth sources. Leave unset (null) to let the system auto‑decide based on query complexity. Setting to true costs many more tokens.",
+                                "description": "Enable deep crawling that follows links from the first results. Activate ONLY when the answer truly benefits from multiple in‑depth sources. Leave unset (null) to let the system auto‑decide based on query complexity. Setting to true costs many more tokens. **Note:** The system may override this based on the Research Mode Policy valve.",
                                 "default": None,
                             },
                             "research_crawl_mode": {
@@ -2579,6 +2586,16 @@ Output ONLY a JSON array of strings. Example for query "fresa": ["fresadora", "f
 
         if not content:
             logger.warning("Homonym detection: empty content")
+            if __event_emitter__ and self.valves.MORE_STATUS:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "🔍 Homonyms detected: None",
+                            "done": False,
+                        },
+                    }
+                )
             return []
 
         try:
@@ -2599,7 +2616,7 @@ Output ONLY a JSON array of strings. Example for query "fresa": ["fresadora", "f
         if self.valves.DEBUG:
             logger.info(f"Homonyms detected: {homonyms}")
 
-        # Emit homonyms found (or none) to the user
+        # Emit homonyms found (or None) to the user
         homonyms_str = ", ".join(homonyms) if homonyms else "None"
         if __event_emitter__ and self.valves.MORE_STATUS:
             await __event_emitter__(
@@ -4146,28 +4163,52 @@ Now evaluate these URLs:
                 await asyncio.sleep(0.3)
             gathered_urls = gathered_urls[:max_urls]
 
-        # Determine research mode and crawl strategy
-        if research_crawl_mode and research_crawl_mode in [
-            "pseudo_adaptive",
-            "llm_guided",
-            "bfs_deep",
-            "research_filter",
-        ]:
+        # Determine research mode and crawl strategy considering the new policy valve
+        policy = self.valves.RESEARCH_MODE_POLICY
+
+        if policy == "always":
             effective_research_mode = True
-            effective_crawl_mode = research_crawl_mode
-            if self.valves.DEBUG:
-                logger.info(
-                    f"Research mode activated via research_crawl_mode parameter: {research_crawl_mode}"
-                )
-        else:
-            effective_research_mode = research_mode or self.user_valves.RESEARCH_MODE
             effective_crawl_mode = (
                 research_crawl_mode or self.user_valves.RESEARCH_CRAWL_MODE
             )
             if self.valves.DEBUG:
-                logger.info(
-                    f"Research mode: {effective_research_mode}, mode: {effective_crawl_mode}"
+                logger.info("Research mode forced ON by valve policy")
+        elif policy == "never":
+            effective_research_mode = False
+            effective_crawl_mode = (
+                research_crawl_mode or self.user_valves.RESEARCH_CRAWL_MODE
+            )
+            if self.valves.DEBUG:
+                logger.info("Research mode forced OFF by valve policy")
+        else:  # auto
+            # Use the original logic: LLM parameter and user valve
+            if research_crawl_mode and research_crawl_mode in [
+                "pseudo_adaptive",
+                "llm_guided",
+                "bfs_deep",
+                "research_filter",
+            ]:
+                effective_research_mode = True
+                effective_crawl_mode = research_crawl_mode
+                if self.valves.DEBUG:
+                    logger.info(
+                        f"Research mode activated via research_crawl_mode parameter: {research_crawl_mode}"
+                    )
+            else:
+                effective_research_mode = (
+                    research_mode or self.user_valves.RESEARCH_MODE
                 )
+                # Si el LLM no dió modo explícito, intentamos auto‑seleccionar
+                if not research_crawl_mode:
+                    effective_crawl_mode = self._auto_select_research_mode(
+                        gathered_urls, query
+                    )
+                else:
+                    effective_crawl_mode = research_crawl_mode
+                if self.valves.DEBUG:
+                    logger.info(
+                        f"Research mode: {effective_research_mode}, mode: {effective_crawl_mode}"
+                    )
 
         self.total_urls = len(gathered_urls)
 
@@ -4551,6 +4592,62 @@ Now evaluate these URLs:
     # endregion
 
     # region ── Research Crawl Router ──────────────────────────────────────────
+
+    def _auto_select_research_mode(self, urls: List[str], query: str) -> str:
+        """
+        Heurística para elegir la mejor estrategia de investigación basada en las URLs.
+        - Si más del 50% de las URLs comparten el mismo dominio y es un dominio tipo wiki/enciclopedia, usa 'bfs_deep'.
+        - Si las URLs tienen slugs descriptivos (contienen guiones, barras, palabras clave), prefiere 'pseudo_adaptive'.
+        - En otros casos, 'research_filter' para evitar ruido.
+        """
+        if not urls:
+            return "pseudo_adaptive"
+
+        from collections import Counter
+
+        domains = [urlparse(u).netloc for u in urls if urlparse(u).netloc]
+        if not domains:
+            return "pseudo_adaptive"
+
+        domain_counts = Counter(domains)
+        most_common_domain, count = domain_counts.most_common(1)[0]
+        domain_ratio = count / len(urls)
+
+        # Dominios típicos de conocimiento profundo
+        knowledge_domains = {
+            "wikipedia.org",
+            "wikimedia.org",
+            "wiki",
+            "readthedocs.io",
+            "github.com",
+            "docs.python.org",
+            "developer.mozilla.org",
+        }
+        is_knowledge_domain = any(kd in most_common_domain for kd in knowledge_domains)
+
+        if domain_ratio > 0.5 and is_knowledge_domain:
+            logger.info(
+                f"Auto-selecting 'bfs_deep' (dominio mayoritario de conocimiento: {most_common_domain})"
+            )
+            return "bfs_deep"
+
+        # Evaluar descriptividad de slugs
+        descriptive_count = 0
+        for url in urls:
+            path = urlparse(url).path
+            # Slugs descriptivos suelen tener varias palabras separadas por guiones o barras
+            parts = [p for p in path.split("/") if p and not p.startswith("?")]
+            if parts and any("-" in p or "_" in p for p in parts):
+                descriptive_count += 1
+
+        if descriptive_count > len(urls) * 0.5:
+            logger.info(
+                "Auto-selecting 'pseudo_adaptive' (URLs con slugs descriptivos)"
+            )
+            return "pseudo_adaptive"
+
+        logger.info("Auto-selecting 'research_filter' (sin patrón claro)")
+        return "research_filter"
 
     async def _research_crawl(
         self,
