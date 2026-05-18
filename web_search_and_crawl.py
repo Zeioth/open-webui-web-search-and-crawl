@@ -4,7 +4,7 @@ description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, a
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.1.6
+version: 3.1.7
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -449,6 +449,11 @@ class Tools:
             title="Crawl4AI Maximum URLs to crawl",
             default=None,
             description="Per-user maximum URLs to crawl.",
+        )
+        CRAWL4AI_MAX_URLS_FORCE: bool = Field(
+            default=False,
+            title="Force Max URLs",
+            description="If true, the LLM URL filter will force the final URL count to reach CRAWL4AI_MAX_URLS by backfilling from rejected URLs. When false, the filter only keeps the URLs deemed relevant by the LLM. Use this valve to experiment: Small % to make results richer, high % of wasting tokens and poison irrelevant context. Good results for enriching cache with filters though.",
         )
         CRAWL4AI_DISPLAY_MEDIA: bool = Field(
             title="Display Media in Chat",
@@ -3109,8 +3114,12 @@ Now evaluate these URLs:
             }
             filtered_urls = [urls[i] for i in range(len(urls)) if i in keep_indices]
 
-            # Ensure we have at least min_urls if possible
-            if min_urls > 0 and len(filtered_urls) < min_urls:
+            # Ensure we have at least min_urls if possible (only if force valve is enabled)
+            if (
+                self.valves.CRAWL4AI_MAX_URLS_FORCE
+                and min_urls > 0
+                and len(filtered_urls) < min_urls
+            ):
                 original_kept = len(filtered_urls)
                 rejected_indices = [
                     i for i in range(len(urls)) if i not in keep_indices
