@@ -4,7 +4,7 @@ description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, a
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.1.7
+version: 3.1.8
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -554,7 +554,7 @@ class Tools:
                 "type": "function",
                 "function": {
                     "name": "search_and_crawl",
-                    "description": "Search the web and crawl the resulting pages to extract detailed content with images and videos. Use this for current events, news, research, or any information that needs web search and detailed content extraction. The user can optionally provide specific URLs to include in the crawl. When research_mode is enabled, multiple crawling strategies are available including pseudo-adaptive keyword scoring, LLM-guided link selection, BFS deep crawling, and research filtering.",
+                    "description": "Search the web and crawl resulting pages to extract detailed content. Use for current events, news, research, or any information needing web search and detailed content extraction. If the user provides specific URLs, they will be included. **Research mode** is automatically activated when the query requires deep coverage (comparisons, historical overviews, multi‑faceted topics). For simple factual lookups, it's disabled to save tokens.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -570,38 +570,26 @@ class Tools:
                             },
                             "max_results": {
                                 "type": "integer",
-                                "description": "Maximum number of search results to crawl (default uses valve setting)",
+                                "description": "Maximum number of search results to crawl. Fewer results reduce token usage. Default uses valve setting (usually 20).",
                                 "default": None,
                             },
                             "research_mode": {
                                 "type": "boolean",
-                                "description": (
-                                    "Enable deep research crawling. Use true for queries requiring multiple sources, "
-                                    "comprehensive information gathering, or complex analysis.\n"
-                                    "Use false for simple facts, quick lookups, recent news, or when a single page suffices.\n"
-                                    "Leave unset to let the system decide based on your best judgment.\n\n"
-                                    "When to use research mode:\n"
-                                    "- Comparisons (e.g., 'compare X vs Y')\n"
-                                    "- Historical overviews (e.g., 'history of the Roman Empire')\n"
-                                    "- Latest developments in a field (e.g., 'best practices for microservices in 2025')\n"
-                                    "- Multi‑faceted questions (e.g., 'impact of climate change on agriculture')\n\n"
-                                    "When NOT to use research mode:\n"
-                                    "- Simple definitions (e.g., 'define photosynthesis')\n"
-                                    "- Current time, weather, or stock price\n"
-                                    "- Single fact lookup (e.g., 'height of Mount Everest')\n"
-                                    "- Recent breaking news (single event)"
-                                ),
+                                "description": "Enable deep crawling that follows links from the first results. Activate ONLY when the answer truly benefits from multiple in‑depth sources. Leave unset (null) to let the system auto‑decide based on query complexity. Setting to true costs many more tokens.",
                                 "default": None,
                             },
                             "research_crawl_mode": {
                                 "type": "string",
                                 "description": (
-                                    "Crawling strategy if research mode is enabled:\n"
-                                    "- pseudo_adaptive: for factual queries, news, or simple lookups.\n"
-                                    "- llm_guided: when you need to select links based on actual content relevance.\n"
-                                    "- bfs_deep: for exhaustive topic coverage (e.g., systematic reviews).\n"
-                                    "- research_filter: when you start from a seed list and only want to follow promising links.\n"
-                                    "Only used when research_mode is true."
+                                    "Crawling strategy if research_mode is true. Choose based on the nature of the topic:\n"
+                                    "- 'pseudo_adaptive': Fast, URL‑based keyword scoring. Best for sites with descriptive URLs (Wikipedia, blogs with clear slugs). Use for factual, well‑known topics where titles already reflect relevance.\n"
+                                    "- 'llm_guided': Slower, sequential, currently uses keyword scoring; reserves the ability to later integrate LLM link selection. Use only if you prefer a conservative pace.\n"
+                                    "- 'bfs_deep': Exhaustive breadth‑first crawl. Ideal when you need complete coverage of a single domain (e.g., a documentation site, a wiki). Set include_external=false to stay on the same domain.\n"
+                                    "- 'research_filter': Content‑aware filtering; follows only links from pages whose extracted content matches the query. Best for mixed‑domain searches where you want to avoid noise. More robust against opaque URLs.\n"
+                                    "Auto‑selection heuristic (if left null and research_mode is true):\n"
+                                    "  - If >50% of the gathered URLs share the same domain and that domain is a known encyclopedia/knowledge base → use 'bfs_deep'.\n"
+                                    "  - Else if URLs have clear, descriptive slugs → 'pseudo_adaptive'.\n"
+                                    "  - Otherwise → 'research_filter' for safety."
                                 ),
                                 "default": None,
                             },
