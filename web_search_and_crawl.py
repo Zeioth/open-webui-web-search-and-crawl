@@ -184,11 +184,11 @@ class Tools:
         )
         CRAWL4AI_MAX_TOKENS: int = Field(
             title="Max Tokens used by Crawl4AI",
-            default=0,
+            default=4000,
             description="Maximum tokens to use for the web search content response. Set to 0 for unlimited.",
         )
         CRAWL4AI_TOKEN_DECAY_ALPHA: float = Field(
-            default=0.5,
+            default=0.7,
             ge=0.0,
             le=2.0,
             title="Token Decay Aggressiveness",
@@ -199,7 +199,7 @@ class Tools:
             "2 = quadratic decay (very aggressive).",
         )
         CRAWL4AI_MIN_PAGE_TOKEN_BUDGET: int = Field(
-            default=100,
+            default=700,
             ge=0,
             title="Minimum Page Token Budget",
             description="If the token budget for a page falls below this number (and CRAWL4AI_MAX_TOKENS > 0), the page will be skipped entirely to avoid useless crawls. Set to 0 to disable.",
@@ -223,17 +223,17 @@ class Tools:
         )
         CRAWL4AI_EXCLUDE_IMAGES: Literal["None", "External", "All"] = Field(
             title="Exclude Images",
-            default="None",
+            default="All",
             description="Exclude images from crawling (None, External, All).",
         )
         CRAWL4AI_WORD_COUNT_THRESHOLD: int = Field(
             title="Word Count Threshold",
-            default=200,
+            default=50,
             description="The minimum word count threshold for content to be included.",
         )
         CRAWL4AI_TEXT_ONLY: bool = Field(
             title="Text Only",
-            default=False,
+            default=True,
             description="Only extract text content, excluding images and other media. (Disables crawling and displaying media in the chat)",
         )
 
@@ -449,21 +449,21 @@ class Tools:
             description="Enable detailedlogging",
         )
         PRELOAD_EMBEDDER: bool = Field(
-            default=False,
+            default=True,
             title="Preload Embedding Model",
-            description="If enabled, the SentenceTransformer model will be loaded at startup (consumes ~80MB RAM). Otherwise, it will be loaded on first use.",
+            description="If enabled, the SentenceTransformer model will be loaded at startup (consumes ~80MB VRAM). Otherwise, it will be loaded on first use.",
         )
 
         # LLM parameters that were previously scattered; placed after provider for logical grouping
         LLM_TEMPERATURE: float = Field(
             title="LLM Temperature",
-            default=0.2,
+            default=0.1,
             description="The temperature to use for the LLM.",
         )
         LLM_MAX_TOKENS: int = Field(
             title="LLM Max Tokens",
-            default=4096,
-            description="The maximum number of tokens to use for the LLM.",
+            default=2024,
+            description="The maximum number of tokens to use for the filter LLM.",
         )
         LLM_TOP_P: float = Field(
             title="LLM Top P",
