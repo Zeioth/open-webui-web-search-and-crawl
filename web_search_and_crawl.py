@@ -111,8 +111,8 @@ class Tools:
         )
         SEARXNG_BASE_URL: str = Field(
             title="SearXNG Search URL",
-            default="http://searxng:8888/search?format=json&q=<query>",
-            description="The full URL for your SearXNG API instance. Insert <query> where the search terms should go.",
+            default="http://host.docker.internal:8888/search?format=json&q=<query>",
+            description="The full URL for your SearXNG API instance. Insert <query> where the search terms should go. Default: http://searxng:8888/search?format=json&q=<query>",
         )
         SEARXNG_API_TOKEN: str = Field(
             title="SearXNG API Token",
@@ -145,8 +145,8 @@ class Tools:
         # ── Crawl4AI – Connection ────────────────────────────────────────────
         CRAWL4AI_BASE_URL: str = Field(
             title="Crawl4AI Base URL",
-            default="http://crawl4ai:11235",
-            description="The base URL for your Crawl4AI instance.",
+            default="http://host.docker.internal:11235",
+            description="The base URL for your Crawl4AI instance. Default: http://crawl4ai:11235",
         )
         CRAWL4AI_USER_AGENT: str = Field(
             title="Crawl4AI User Agent",
@@ -199,7 +199,7 @@ class Tools:
             "2 = quadratic decay (very aggressive).",
         )
         CRAWL4AI_MIN_PAGE_TOKEN_BUDGET: int = Field(
-            default=200,
+            default=100,
             ge=0,
             title="Minimum Page Token Budget",
             description="If the token budget for a page falls below this number (and CRAWL4AI_MAX_TOKENS > 0), the page will be skipped entirely to avoid useless crawls. Set to 0 to disable.",
@@ -295,12 +295,12 @@ class Tools:
         # ── Features ─────────────────────────────────────────────────────────
         USE_QUERY_EXPANSION: bool = Field(
             title="Use Query Expansion",
-            default=False,
+            default=True,
             description="Use LLM to generate related search terms to find more relevant results.",
         )
         USE_LLM_URL_FILTER: bool = Field(
             title="Use LLM URL Filter",
-            default=False,
+            default=True,
             description="Use LLM to analyze and filter out URLs that are obviously unrelated to the search query. This adds a small delay but improves relevance and saves tokens.",
         )
         USE_SEMANTIC_FILTER: bool = Field(
@@ -361,8 +361,8 @@ class Tools:
         # ── LLM Provider ─────────────────────────────────────────────────────
         LLM_BASE_URL: str = Field(
             title="LLM Base URL",
-            default="https://openrouter.ai/api/v1",
-            description="The base URL for your preferred OpenAI-compatible LLM.",
+            default="http://host.docker.internal:11434",
+            description="The base URL for your preferred OpenAI-compatible LLM. Default: https://openrouter.ai/api/",
         )
         LLM_API_TOKEN: str = Field(
             title="LLM API Token",
@@ -371,7 +371,7 @@ class Tools:
         )
         LLM_PROVIDER: str = Field(
             title="LLM Provider and model",
-            default="openrouter/@preset/default",
+            default="ollama/Inference/Schematron:3B",
             description="The LLM provider and model to use (see https://docs.crawl4ai.com/core/browser-crawler-config/#3-llmconfig-essentials).",
             examples=[
                 "openai/gpt-4o",
@@ -383,13 +383,13 @@ class Tools:
         )
         EXPANSION_LLM_PROVIDER: str = Field(
             title="LLM Provider for Query Expansion",
-            default="",
+            default="ollama/llama3.2:3B",
             description="LLM provider/model to use for query expansion. If empty, falls back to LLM_PROVIDER.",
             examples=["ollama/llama3.2", "openai/gpt-4o-mini"],
         )
         FILTER_LLM_PROVIDER: str = Field(
             title="LLM Provider for URL Filtering",
-            default="",
+            default="ollama/llama3.2:3B",
             description="LLM provider/model to use for URL filtering. If empty, falls back to LLM_PROVIDER.",
             examples=["ollama/llama3.2", "openai/gpt-4o-mini"],
         )
@@ -457,7 +457,7 @@ class Tools:
         # LLM parameters that were previously scattered; placed after provider for logical grouping
         LLM_TEMPERATURE: float = Field(
             title="LLM Temperature",
-            default=0.3,
+            default=0.2,
             description="The temperature to use for the LLM.",
         )
         LLM_MAX_TOKENS: int = Field(
