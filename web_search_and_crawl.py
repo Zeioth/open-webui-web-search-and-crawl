@@ -4,7 +4,7 @@ description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, a
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.3.0
+version: 3.4.0
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -333,7 +333,7 @@ class Tools:
         RAW_FILE_MAX_SIZE: int = Field(
             default=100_000,
             title="Raw File Max Size (bytes)",
-            description="Maximum bytes to fetch for a raw file URL. Larger files will be truncated.",
+            description="Maximum bytes to fetch for a raw file URL. Set to 0 for unlimited.",
         )
         RAW_FILE_EXTENSIONS: str = Field(
             default=".py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.toml,.cfg,.ini,.sh,.bash,.md,.txt,.csv,.log,.env,.xml,.html,.css,.java,.c,.cpp,.h,.rs,.go,.rb,.php,.sql,.r,.m,.swift,.kt,.scala,.lua,.vim,.dockerfile,.makefile,.gradle,.properties,.conf,.rst,.adoc,.tex,.bib,.svg,.graphql,.proto",
@@ -620,13 +620,22 @@ class Tools:
                 "type": "function",
                 "function": {
                     "name": "search_and_crawl",
-                    "description": "Search the web and crawl resulting pages to extract detailed content. Use for current events, news, research, or any information needing web search and detailed content extraction. If the user provides specific URLs, they will be included. **Research mode** is automatically activated when the query requires deep coverage (comparisons, historical overviews, multi‑faceted topics). For simple factual lookups, it's disabled to save tokens.",
+                    "description": (
+                        "Search the web and crawl resulting pages to extract detailed content. "
+                        "Use for current events, news, research, or any information needing web search and detailed content extraction. "
+                        "If the user provides specific URLs, they will be included. "
+                        "IMPORTANT: If the user provides URLs that point to raw source code files "
+                        "(domains like raw.githubusercontent.com, gist.githubusercontent.com, raw.gitlab.com, "
+                        "or URLs ending with .py, .js, .ts, .json, .yaml, etc.), call this function with an EMPTY query ('') "
+                        "and pass the URLs in the 'urls' parameter to fetch their content directly WITHOUT performing any web search."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "The search query (e.g., 'latest AI developments', 'Python tutorial')",
+                                "description": "The search query (e.g., 'latest AI developments', 'Python tutorial'). Leave empty when you only want to fetch specific URLs without searching the web.",
+                                "default": "",
                             },
                             "urls": {
                                 "type": "array",
@@ -660,7 +669,6 @@ class Tools:
                                 "default": None,
                             },
                         },
-                        "required": ["query"],
                     },
                 },
             },
@@ -3517,18 +3525,18 @@ Now evaluate these URLs:
                         )
                         return None
 
-                    # Read up to max_size bytes
+                    # Read up to max_size bytes, 0 means unlimited
                     chunks = []
                     total = 0
                     async for chunk in resp.content.iter_chunked(8192):
                         total += len(chunk)
-                        if total > max_size:
+                        if max_size > 0 and total > max_size:
                             chunks.append(chunk[: max_size - (total - len(chunk))])
                             break
                         chunks.append(chunk)
                     raw_text = b"".join(chunks).decode("utf-8", errors="replace")
 
-                    if total > max_size:
+                    if max_size > 0 and total > max_size:
                         raw_text += (
                             "\n\n[Content truncated — file exceeds RAW_FILE_MAX_SIZE]"
                         )
@@ -4277,7 +4285,7 @@ Now evaluate these URLs:
 
     async def search_and_crawl(
         self,
-        query: str,
+        query: str = "",
         urls: Optional[List[str]] = None,
         max_results: Optional[int] = None,
         max_images: Optional[int] = None,
@@ -4288,6 +4296,7 @@ Now evaluate these URLs:
     ) -> Union[list, str]:
         """
         Main entry point for web search and crawl.
+        If query is empty, only processes the provided URLs without searching.
         """
         start_time = time.time()
         logger.info(f"Starting search and crawl for '{query}'")
@@ -4317,15 +4326,6 @@ Now evaluate these URLs:
                     },
                 }
             )
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"🔍 Searching for '{query}'...",
-                        "done": False,
-                    },
-                }
-            )
 
         # Preload embedder model in background if not already loaded
         global _EMBEDDER_INSTANCE
@@ -4339,6 +4339,137 @@ Now evaluate these URLs:
                     pass  # will load on first use if preload fails
 
             asyncio.create_task(preload_embedder())
+
+        # ── Mode without query: only process provided URLs ──────────────────
+        if not query or not query.strip():
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "No query provided, processing URLs directly...",
+                            "done": False,
+                        },
+                    }
+                )
+
+            if not urls:
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "No query and no URLs provided.",
+                                "done": True,
+                            },
+                        }
+                    )
+                return "No query and no URLs provided."
+
+            # Normalize and deduplicate URLs
+            gathered_urls = []
+            for u in urls:
+                if not u.startswith("http"):
+                    u = f"https://{u}"
+                if u not in gathered_urls:
+                    gathered_urls.append(u)
+
+            # Separate raw vs normal (same logic as existing)
+            raw_urls = []
+            normal_urls = []
+            for url in gathered_urls:
+                converted = self._convert_blob_to_raw_url(url)
+                if converted and self._is_raw_file_url(converted):
+                    raw_urls.append(converted)
+                elif self._is_raw_file_url(url):
+                    raw_urls.append(url)
+                else:
+                    normal_urls.append(url)
+
+            raw_content = []
+            if raw_urls:
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"📄 Fetching {len(raw_urls)} raw file(s) directly...",
+                                "done": False,
+                            },
+                        }
+                    )
+                raw_content = await self._fetch_raw_content(
+                    raw_urls, "", __event_emitter__
+                )
+                # Emit citations for each raw file
+                if __event_emitter__:
+                    for item in raw_content:
+                        await __event_emitter__(
+                            {
+                                "type": "citation",
+                                "data": {
+                                    "document": [item["summary"]],
+                                    "metadata": [{"source": item["source"]}],
+                                    "source": {"name": item["topic"]},
+                                },
+                            }
+                        )
+
+            # Process normal URLs (without query, only direct crawl)
+            normal_results = []
+            normal_images = []
+            normal_videos = []
+            if normal_urls:
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"🌐 Crawling {len(normal_urls)} non‑raw URL(s)...",
+                                "done": False,
+                            },
+                        }
+                    )
+                result = await self._crawl_urls_with_cache(
+                    urls=normal_urls,
+                    query="",  # without query
+                    max_tokens=self.valves.CRAWL4AI_MAX_TOKENS,
+                    extract_links=False,
+                    __event_emitter__=__event_emitter__,
+                )
+                normal_results = result["content"]
+                normal_images = result.get("images", [])
+                normal_videos = result.get("videos", [])
+
+            # Combine and normalize
+            final_content = raw_content + normal_results
+            final_content = self._normalize_content(final_content)
+            final_content = await self._deduplicate_content(final_content)
+
+            # Show images/videos (if any)
+            await self._display_media(
+                normal_images,
+                normal_videos,
+                max_images,
+                __event_emitter__,
+            )
+
+            await self._emit_final_status(
+                final_content, start_time, __event_emitter__, 0
+            )
+            return final_content
+
+        # ── Normal mode with query ──────────────────────────────────────────
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"🔍 Searching for '{query}'...",
+                        "done": False,
+                    },
+                }
+            )
 
         # Trigger cache reindex if valve is set
         if self.valves.CACHE_REINDEX:
