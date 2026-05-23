@@ -4,7 +4,7 @@ description: Search and Crawls the web using SearXNG, OpenWebUI Native Search, a
 author: lexiismadd, zeioth
 author_url: https://github.com/lexiismadd, https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 3.2.0
+version: 3.3.0
 license: MIT
 requirements: aiohttp, loguru, crawl4ai, orjson, tiktoken, sentence-transformers, chromadb
 """
@@ -25,7 +25,7 @@ import uuid
 import hashlib
 import numpy as np
 import threading
-from urllib.parse import parse_qs, urlparse, quote
+from urllib.parse import parse_qs, urlparse, quote, unquote
 from pydantic import BaseModel, Field
 from typing import Any, List, Optional, Union, Callable, Literal, Tuple
 from loguru import logger
@@ -322,6 +322,23 @@ class Tools:
             default=False,
             title="Reindex Cache",
             description="Set to true and then perform any search to trigger a one‑time re‑evaluation of all cached chunks using the LLM filter. After completion it will be set back to false automatically.",
+        )
+
+        # ── Raw File Fetch ─────────────────────────────────────────────────
+        RAW_FILE_FETCH_ENABLED: bool = Field(
+            default=True,
+            title="Raw File Fetch",
+            description="Fetch raw file URLs (GitHub raw, etc.) directly via HTTP, bypassing Crawl4AI and cache. Returns full unprocessed content.",
+        )
+        RAW_FILE_MAX_SIZE: int = Field(
+            default=100_000,
+            title="Raw File Max Size (bytes)",
+            description="Maximum bytes to fetch for a raw file URL. Larger files will be truncated.",
+        )
+        RAW_FILE_EXTENSIONS: str = Field(
+            default=".py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.toml,.cfg,.ini,.sh,.bash,.md,.txt,.csv,.log,.env,.xml,.html,.css,.java,.c,.cpp,.h,.rs,.go,.rb,.php,.sql,.r,.m,.swift,.kt,.scala,.lua,.vim,.dockerfile,.makefile,.gradle,.properties,.conf,.rst,.adoc,.tex,.bib,.svg,.graphql,.proto",
+            title="Raw File Extensions",
+            description="Comma-separated list of file extensions that should always be fetched as raw content.",
         )
 
         # ── Validation ─────────────────────────────────────────────────────
@@ -3386,6 +3403,185 @@ Now evaluate these URLs:
 
     # endregion
 
+    # region ── Raw File Fetch ─────────────────────────────────────────────────
+
+    def _is_raw_file_url(self, url: str) -> bool:
+        """
+        Determine if a URL points to a raw file that should be fetched directly
+        without going through Crawl4AI or cache.
+        """
+        if not url or not self.valves.RAW_FILE_FETCH_ENABLED:
+            return False
+
+        url_lower = url.lower()
+        parsed = urlparse(url)
+
+        # Known raw hosting patterns
+        raw_hosts = [
+            "raw.githubusercontent.com",
+            "gist.githubusercontent.com",
+            "raw.gitlab.com",
+        ]
+        if any(host in parsed.netloc.lower() for host in raw_hosts):
+            return True
+
+        # GitLab raw path pattern: gitlab.com/*/-/raw/*
+        if "gitlab.com" in parsed.netloc and "/-/raw/" in parsed.path:
+            return True
+
+        # Bitbucket raw pattern
+        if "bitbucket.org" in parsed.netloc and "/raw/" in parsed.path:
+            return True
+
+        # Pastebin raw patterns
+        pastebin_raw_patterns = [
+            "pastebin.com/raw/",
+            "hastebin.com/raw/",
+            "dpaste.com",
+        ]
+        if any(p in url_lower for p in pastebin_raw_patterns):
+            return True
+
+        # Extension-based detection
+        extensions = [
+            e.strip().lower()
+            for e in self.valves.RAW_FILE_EXTENSIONS.split(",")
+            if e.strip()
+        ]
+        path_only = parsed.path.rstrip("/").lower()
+        if any(path_only.endswith(ext) for ext in extensions):
+            return True
+        if any(url_lower.endswith(ext) for ext in extensions):
+            return True
+
+        return False
+
+    @staticmethod
+    def _convert_blob_to_raw_url(url: str) -> Optional[str]:
+        """
+        Convert a GitHub/GitLab blob URL to its raw equivalent.
+        Returns None if conversion is not applicable.
+        """
+        # GitHub: github.com/{user}/{repo}/blob/{ref}/{path}
+        #      → raw.githubusercontent.com/{user}/{repo}/{ref}/{path}
+        gh_pattern = re.compile(
+            r"^https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$",
+            re.IGNORECASE,
+        )
+        m = gh_pattern.match(url)
+        if m:
+            user, repo, ref, path = m.groups()
+            return f"https://raw.githubusercontent.com/{user}/{repo}/{ref}/{path}"
+
+        # GitLab: gitlab.com/{user}/{repo}/-/blob/{ref}/{path}
+        #      → gitlab.com/{user}/{repo}/-/raw/{ref}/{path}
+        gl_pattern = re.compile(
+            r"^(https?://gitlab\.com/[^/]+/[^/]+)/-/blob/([^/]+)/(.+)$",
+            re.IGNORECASE,
+        )
+        m = gl_pattern.match(url)
+        if m:
+            base, ref, path = m.groups()
+            return f"{base}/-/raw/{ref}/{path}"
+
+        return None
+
+    async def _fetch_raw_content(
+        self,
+        urls: List[str],
+        query: str = "",
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> List[dict]:
+        """
+        Fetch raw file URLs directly via HTTP and return structured content.
+        No caching, no Crawl4AI involved.
+        """
+        if not urls:
+            return []
+
+        max_size = self.valves.RAW_FILE_MAX_SIZE
+        results = []
+
+        async def fetch_one(url: str, session: aiohttp.ClientSession) -> Optional[dict]:
+            try:
+                headers = {
+                    "User-Agent": self.valves.CRAWL4AI_USER_AGENT,
+                    "Accept": "text/plain,text/*,application/octet-stream,*/*",
+                }
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            f"Raw fetch failed for {url}: HTTP {resp.status}"
+                        )
+                        return None
+
+                    # Read up to max_size bytes
+                    chunks = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(8192):
+                        total += len(chunk)
+                        if total > max_size:
+                            chunks.append(chunk[: max_size - (total - len(chunk))])
+                            break
+                        chunks.append(chunk)
+                    raw_text = b"".join(chunks).decode("utf-8", errors="replace")
+
+                    if total > max_size:
+                        raw_text += (
+                            "\n\n[Content truncated — file exceeds RAW_FILE_MAX_SIZE]"
+                        )
+
+                    # Derive a title from the URL path
+                    path = urlparse(url).path.rstrip("/")
+                    filename = path.split("/")[-1] if path else "raw file"
+                    try:
+                        filename = unquote(filename)
+                    except Exception:
+                        pass
+
+                    ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+                    lang = ext if ext and len(ext) <= 20 else ""
+
+                    return {
+                        "topic": f"Raw: {filename}",
+                        "summary": f"```{lang}\n{raw_text}\n```",
+                        "source": url,
+                    }
+            except asyncio.TimeoutError:
+                logger.warning(f"Raw fetch timeout for {url}")
+                return None
+            except Exception as e:
+                logger.error(f"Raw fetch error for {url}: {e}")
+                return None
+
+        connector = aiohttp.TCPConnector(limit_per_host=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [fetch_one(url, session) for url in urls]
+            fetched = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item in fetched:
+            if isinstance(item, dict) and item is not None:
+                results.append(item)
+            elif isinstance(item, Exception):
+                logger.error(f"Raw fetch exception: {item}")
+
+        if results and __event_emitter__ and self.valves.MORE_STATUS:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"📄 Raw files fetched: {len(results)}/{len(urls)}",
+                        "done": False,
+                    },
+                }
+            )
+
+        return results
+
+    # endregion
+
     # region ── Unified Crawler (Cache + Batches) ─────────────────────────────
 
     async def _crawl_urls_with_cache(
@@ -4164,7 +4360,52 @@ Now evaluate these URLs:
             query, urls, __event_emitter__, __user__
         )
 
-        if not gathered_urls:
+        # 1b. Separate raw file URLs (fetch directly, no cache, no Crawl4AI)
+        raw_urls = []
+        normal_urls = []
+        for url in gathered_urls:
+            # Try to convert blob URLs to raw
+            converted = self._convert_blob_to_raw_url(url)
+            if converted and self._is_raw_file_url(converted):
+                raw_urls.append(converted)
+            elif self._is_raw_file_url(url):
+                raw_urls.append(url)
+            else:
+                normal_urls.append(url)
+
+        raw_content = []
+        if raw_urls:
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"📄 Fetching {len(raw_urls)} raw file(s) directly...",
+                            "done": False,
+                        },
+                    }
+                )
+            raw_content = await self._fetch_raw_content(
+                raw_urls, query, __event_emitter__
+            )
+            # Emit citations for raw files
+            if __event_emitter__:
+                for item in raw_content:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [item["summary"]],
+                                "metadata": [{"source": item["source"]}],
+                                "source": {"name": item["topic"]},
+                            },
+                        }
+                    )
+
+        # Replace gathered_urls with normal URLs only (raw already processed)
+        gathered_urls = normal_urls
+
+        if not gathered_urls and not raw_content:
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -4229,7 +4470,7 @@ Now evaluate these URLs:
                     await asyncio.sleep(0.3)
                 gathered_for_round = gathered_for_round[:max_urls]
 
-            # Determine research mode and crawl strategy (same logic)
+            # Determine research mode and crawl strategy
             mode_policy = self.valves.RESEARCH_MODE_POLICY
             strategy_policy = self.valves.RESEARCH_STRATEGY_POLICY
 
@@ -4378,8 +4619,8 @@ Now evaluate these URLs:
                 all_crawl_results = round_crawl_results
                 break
 
-        # Final content is in all_crawl_results
-        crawl_results = all_crawl_results
+        # Merge raw content into final results (raw content goes first to give it priority)
+        crawl_results = raw_content + all_crawl_results
 
         # Normalize final results
         crawl_results = self._normalize_content(crawl_results)
@@ -4578,6 +4819,7 @@ Generate ONLY the new query string, nothing else."""
         """
         Internal function to crawl URLs and extract content (fully async with aiohttp).
         Returns enriched results including raw markdown for caching.
+        Note: Raw file URLs are handled separately in search_and_crawl; they never reach this method.
         """
         if isinstance(urls, str):
             urls = [urls]
@@ -4664,8 +4906,6 @@ Generate ONLY the new query string, nothing else."""
             exclude_all_images=self.valves.CRAWL4AI_EXCLUDE_IMAGES == "All",
             exclude_external_images=self.valves.CRAWL4AI_EXCLUDE_IMAGES == "External",
         )
-
-        # (Removed redundant status messages – batch-level messages are sufficient)
 
         headers = {"Content-Type": "application/json"}
         payload = {
