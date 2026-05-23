@@ -94,19 +94,19 @@ class Tools:
         # ── Initial Response ─────────────────────────────────────────────────
         INITIAL_RESPONSE: str = Field(
             title="Initial delta response",
-            default="I just need to do a search online to get some more info, I'll get back to you in a minute or so with a response if thats ok with you...",
+            default="I'm going to search it on the internet using SearXNG....",
             description="The response the tool will post in the chat window when it starts its search and crawl. Set as blank for no response.",
         )
 
         # ── Search Engines ───────────────────────────────────────────────────
         USE_NATIVE_SEARCH: bool = Field(
             title="Use Native Search",
-            default=True,
+            default=False,
             description="Use OpenWebUI's native web search (in addition to or instead of SearXNG).",
         )
         SEARCH_WITH_SEARXNG: bool = Field(
             title="Search with SearXNG",
-            default=False,
+            default=True,
             description="Use SearXNG for gathering additional URLs for crawling.",
         )
         SEARXNG_BASE_URL: str = Field(
