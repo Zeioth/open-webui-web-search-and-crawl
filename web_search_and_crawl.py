@@ -446,7 +446,7 @@ class Tools:
         DEBUG: bool = Field(
             title="Debug logging",
             default=True,
-            description="Enable detailed debug logging",
+            description="Enable detailedlogging",
         )
         PRELOAD_EMBEDDER: bool = Field(
             default=False,
