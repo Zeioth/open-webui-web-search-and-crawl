@@ -622,10 +622,14 @@ class Tools:
                     "name": "search_and_crawl",
                     "description": (
                         "Search the web and crawl resulting pages to extract detailed content. "
-                        "If the user provides URLs of raw source files (hosts like raw.githubusercontent.com, gist.githubusercontent.com, raw.gitlab.com, "
-                        "or URLs ending with .py, .js, .ts, .json, .yaml, .md, etc.), you MUST call this function with an empty string query '' "
-                        "and pass ALL those URLs in the 'urls' parameter. Do NOT generate a search query for those. "
-                        "Only use a search query when the user asks a question or wants information from the web."
+                        "The returned content is already processed and ready to use. "
+                        "You can combine it with your own knowledge when appropriate. "
+                        "IMPORTANT: If the user provides URLs that point to raw source code files "
+                        "(domains like raw.githubusercontent.com, gist.githubusercontent.com, raw.gitlab.com, "
+                        "or URLs ending with .py, .js, .ts, .json, .yaml, .md, etc.), call this function with "
+                        "an EMPTY query ('') and pass ALL those URLs in the 'urls' parameter. "
+                        "Do NOT generate a search query for those. "
+                        "Do not mention the internal name of this tool (search_and_crawl) in your final answer."
                     ),
                     "parameters": {
                         "type": "object",
