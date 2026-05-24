@@ -622,12 +622,10 @@ class Tools:
                     "name": "search_and_crawl",
                     "description": (
                         "Search the web and crawl resulting pages to extract detailed content. "
-                        "Use for current events, news, research, or any information needing web search and detailed content extraction. "
-                        "If the user provides specific URLs, they will be included. "
-                        "IMPORTANT: If the user provides URLs that point to raw source code files "
-                        "(domains like raw.githubusercontent.com, gist.githubusercontent.com, raw.gitlab.com, "
-                        "or URLs ending with .py, .js, .ts, .json, .yaml, etc.), call this function with an EMPTY query ('') "
-                        "and pass the URLs in the 'urls' parameter to fetch their content directly WITHOUT performing any web search."
+                        "If the user provides URLs of raw source files (hosts like raw.githubusercontent.com, gist.githubusercontent.com, raw.gitlab.com, "
+                        "or URLs ending with .py, .js, .ts, .json, .yaml, .md, etc.), you MUST call this function with an empty string query '' "
+                        "and pass ALL those URLs in the 'urls' parameter. Do NOT generate a search query for those. "
+                        "Only use a search query when the user asks a question or wants information from the web."
                     ),
                     "parameters": {
                         "type": "object",
@@ -3494,99 +3492,122 @@ Now evaluate these URLs:
 
         return None
 
-    async def _fetch_raw_content(
-        self,
-        urls: List[str],
-        query: str = "",
-        __event_emitter__: Callable[[dict], Any] = None,
-    ) -> List[dict]:
-        """
-        Fetch raw file URLs directly via HTTP and return structured content.
-        No caching, no Crawl4AI involved.
-        """
-        if not urls:
-            return []
 
-        max_size = self.valves.RAW_FILE_MAX_SIZE
-        results = []
+async def _fetch_raw_content(
+    self,
+    urls: List[str],
+    query: str = "",
+    __event_emitter__: Callable[[dict], Any] = None,
+) -> List[dict]:
+    if not urls:
+        return []
 
-        async def fetch_one(url: str, session: aiohttp.ClientSession) -> Optional[dict]:
-            try:
-                headers = {
-                    "User-Agent": self.valves.CRAWL4AI_USER_AGENT,
-                    "Accept": "text/plain,text/*,application/octet-stream,*/*",
-                }
-                async with session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
-                    if resp.status >= 400:
-                        logger.warning(
-                            f"Raw fetch failed for {url}: HTTP {resp.status}"
-                        )
-                        return None
+    # Emit start message with URL list
+    if __event_emitter__ and self.valves.MORE_STATUS:
+        url_list = ", ".join(urls[:3])
+        if len(urls) > 3:
+            url_list += f" and {len(urls)-3} more"
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": f"📄 Fetching raw files: {url_list}",
+                    "done": False,
+                },
+            }
+        )
 
-                    # Read up to max_size bytes, 0 means unlimited
-                    chunks = []
-                    total = 0
-                    async for chunk in resp.content.iter_chunked(8192):
-                        total += len(chunk)
-                        if max_size > 0 and total > max_size:
-                            chunks.append(chunk[: max_size - (total - len(chunk))])
-                            break
-                        chunks.append(chunk)
-                    raw_text = b"".join(chunks).decode("utf-8", errors="replace")
+    max_size = self.valves.RAW_FILE_MAX_SIZE
+    results = []
 
+    async def fetch_one(url: str, session: aiohttp.ClientSession) -> Optional[dict]:
+        try:
+            headers = {
+                "User-Agent": self.valves.CRAWL4AI_USER_AGENT,
+                "Accept": "text/plain,text/*,application/octet-stream,*/*",
+            }
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(f"Raw fetch failed for {url}: HTTP {resp.status}")
+                    return None
+
+                # Read up to max_size bytes, 0 means unlimited
+                chunks = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(8192):
+                    total += len(chunk)
                     if max_size > 0 and total > max_size:
-                        raw_text += (
-                            "\n\n[Content truncated — file exceeds RAW_FILE_MAX_SIZE]"
-                        )
+                        chunks.append(chunk[: max_size - (total - len(chunk))])
+                        break
+                    chunks.append(chunk)
+                raw_text = b"".join(chunks).decode("utf-8", errors="replace")
 
-                    # Derive a title from the URL path
-                    path = urlparse(url).path.rstrip("/")
-                    filename = path.split("/")[-1] if path else "raw file"
-                    try:
-                        filename = unquote(filename)
-                    except Exception:
-                        pass
+                if max_size > 0 and total > max_size:
+                    raw_text += (
+                        "\n\n[Content truncated — file exceeds RAW_FILE_MAX_SIZE]"
+                    )
 
-                    ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
-                    lang = ext if ext and len(ext) <= 20 else ""
+                # Derive a title from the URL path
+                path = urlparse(url).path.rstrip("/")
+                filename = path.split("/")[-1] if path else "raw file"
+                try:
+                    filename = unquote(filename)
+                except Exception:
+                    pass
 
-                    return {
-                        "topic": f"Raw: {filename}",
-                        "summary": f"```{lang}\n{raw_text}\n```",
-                        "source": url,
-                    }
-            except asyncio.TimeoutError:
-                logger.warning(f"Raw fetch timeout for {url}")
-                return None
-            except Exception as e:
-                logger.error(f"Raw fetch error for {url}: {e}")
-                return None
+                ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+                lang = ext if ext and len(ext) <= 20 else ""
 
-        connector = aiohttp.TCPConnector(limit_per_host=10)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [fetch_one(url, session) for url in urls]
-            fetched = await asyncio.gather(*tasks, return_exceptions=True)
+                # Emit per-file status
+                if __event_emitter__ and self.valves.MORE_STATUS:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"📄 Fetched raw file: {filename} ({len(raw_text)} chars)",
+                                "done": False,
+                            },
+                        }
+                    )
 
-        for item in fetched:
-            if isinstance(item, dict) and item is not None:
-                results.append(item)
-            elif isinstance(item, Exception):
-                logger.error(f"Raw fetch exception: {item}")
-
-        if results and __event_emitter__ and self.valves.MORE_STATUS:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"📄 Raw files fetched: {len(results)}/{len(urls)}",
-                        "done": False,
-                    },
+                return {
+                    "topic": f"Raw: {filename}",
+                    "summary": f"[KEEP]\n```{lang}\n{raw_text}\n```",  # [integration]: Context manager
+                    "source": url,
                 }
-            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Raw fetch timeout for {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Raw fetch error for {url}: {e}")
+            return None
 
-        return results
+    connector = aiohttp.TCPConnector(limit_per_host=10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch_one(url, session) for url in urls]
+        fetched = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for item in fetched:
+        if isinstance(item, dict) and item is not None:
+            results.append(item)
+        elif isinstance(item, Exception):
+            logger.error(f"Raw fetch exception: {item}")
+
+    # Final summary (only if results)
+    if results and __event_emitter__ and self.valves.MORE_STATUS:
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": f"📄 Raw files fetched: {len(results)}/{len(urls)}",
+                    "done": False,
+                },
+            }
+        )
+
+    return results
 
     # endregion
 
